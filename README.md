@@ -37,7 +37,7 @@ npm start
 ```
 
 When TUI is enabled, an onboarding prompt lets users pick workspace path, ATP plan path, agent provider (`codex` or `claude`), and model for that session.
-The onboarding wizard is keyboard-driven (`Up/Down`, `Enter`, `Esc`) with an orange framed TUI, and can also set worker count plus Codex-only runtime settings (reasoning effort, sandbox mode).
+The onboarding wizard is keyboard-driven (`Up/Down`, `Enter`, `Esc`) with an orange framed TUI, and can also set worker count, commit-per-node behavior, plus Codex-only runtime settings (reasoning effort, sandbox mode).
 It includes a full-width step header and supports back-navigation (`Esc` in menus, `/back` in text inputs).
 Path inputs support `Tab` filesystem autocompletion.
 
@@ -60,6 +60,7 @@ npm start -- --agent-provider claude --onboarding false --model sonnet
 - `--prompt-file <path>`: worker prompt (defaults to `RUNNER.md`)
 - `--agent-provider <name>`: `codex` or `claude`
 - `--workers <n>`: parallel worker count
+- `--commit-per-node <bool>`: enable/disable one git commit per completed node
 - `--model <name>`: model name for selected provider
 - `--claude-bin <path>`: Claude CLI binary (default: `claude`)
 - `--onboarding <bool>`: enable/disable interactive startup selector

@@ -97,6 +97,7 @@ interface RunnerConfig {
   modelExplicit: boolean;
   providerExplicit: boolean;
   workersExplicit: boolean;
+  commitPerNodeExplicit: boolean;
   reasoningExplicit: boolean;
   sandboxExplicit: boolean;
   workers: number;
@@ -133,6 +134,7 @@ const ONBOARDING_STEP_LABELS = [
   "Model",
   "Reasoning",
   "Sandbox",
+  "Commit",
   "Workers",
   "Confirm",
 ] as const;
@@ -836,6 +838,7 @@ function resolveConfig(argv: string[]): RunnerConfig | null {
   const onboardingEnabled = readBooleanOption(args, "onboarding", "ATP_RUNNER_ONBOARDING", true);
 
   const workersExplicit = hasExplicitOption(args, "workers", "ATP_RUNNER_WORKERS");
+  const commitPerNodeExplicit = hasExplicitOption(args, "commit-per-node", "ATP_RUNNER_COMMIT_PER_NODE");
   const agentPrefix = readStringOption(args, "agent-prefix", "ATP_RUNNER_AGENT_PREFIX", "codex_agent");
   const agentProvider = readAgentProvider(args);
   const modelExplicit = hasExplicitOption(args, "model", "ATP_RUNNER_MODEL");
@@ -867,6 +870,7 @@ function resolveConfig(argv: string[]): RunnerConfig | null {
     modelExplicit,
     providerExplicit,
     workersExplicit,
+    commitPerNodeExplicit,
     reasoningExplicit,
     sandboxExplicit,
     agentPrefix,
@@ -1237,6 +1241,7 @@ async function runOnboarding(config: RunnerConfig): Promise<RunnerConfig> {
     config.providerExplicit &&
     config.modelExplicit &&
     config.workersExplicit &&
+    config.commitPerNodeExplicit &&
     config.reasoningExplicit &&
     config.sandboxExplicit
   ) {
@@ -1490,6 +1495,43 @@ async function runOnboarding(config: RunnerConfig): Promise<RunnerConfig> {
       }
 
       case 6: {
+        if (next.commitPerNodeExplicit) {
+          stepIndex += 1;
+          break;
+        }
+        const commitChoice = await askArrowMenu<boolean>(
+          "ATP Runner :: Commit Per Node",
+          [
+            {
+              label: "Enable commit-per-node",
+              value: true,
+              description: "Create one local git commit for each completed node with file changes.",
+            },
+            {
+              label: "Disable commit-per-node",
+              value: false,
+              description: "Do not enforce one commit per node.",
+            },
+          ],
+          next.commitPerNode ? 0 : 1,
+          "Local commits only. The runner never pushes to GitHub automatically.",
+          meta,
+        );
+        if (commitChoice.kind === "cancel") {
+          throw new Error("Onboarding cancelled by user.");
+        }
+        if (commitChoice.kind === "back") {
+          if (!goBack()) {
+            throw new Error("Onboarding cancelled by user.");
+          }
+          break;
+        }
+        next.commitPerNode = commitChoice.value;
+        stepIndex += 1;
+        break;
+      }
+
+      case 7: {
         if (next.workersExplicit) {
           stepIndex += 1;
           break;
@@ -1533,7 +1575,7 @@ async function runOnboarding(config: RunnerConfig): Promise<RunnerConfig> {
       }
 
       default: {
-        const summary = `provider=${next.agentProvider}  model=${next.model}  workers=${next.workers}`;
+        const summary = `provider=${next.agentProvider}  model=${next.model}  workers=${next.workers}  commit_per_node=${next.commitPerNode ? "on" : "off"}`;
         const startChoice = await askArrowMenu<"start" | "cancel">(
           "ATP Runner :: Start Run?",
           [
@@ -1541,7 +1583,7 @@ async function runOnboarding(config: RunnerConfig): Promise<RunnerConfig> {
             { label: "Cancel", value: "cancel", description: "Exit without running." },
           ],
           0,
-          `${ANSI.dim}workspace: ${next.projectRoot}${ANSI.reset}\n${ANSI.dim}plan: ${next.atpFile}${ANSI.reset}`,
+          `${ANSI.dim}workspace: ${next.projectRoot}${ANSI.reset}\n${ANSI.dim}plan: ${next.atpFile}${ANSI.reset}\n${ANSI.dim}commit per node: ${next.commitPerNode ? "enabled" : "disabled"}${ANSI.reset}`,
           meta,
         );
         if (startChoice.kind === "cancel") {
