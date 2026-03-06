@@ -66,6 +66,11 @@ npm start -- --agent-provider claude --onboarding false --model sonnet
 - `--onboarding <bool>`: enable/disable interactive startup selector
 - `--no-tui`: disable live terminal dashboard
 
+Default model behavior:
+
+- Codex provider defaults to `gpt-5.4`
+- Claude provider defaults to `sonnet`
+
 Environment variable equivalents are supported (for example `ATP_FILE`, `ATP_PROJECT_ROOT`, `ATP_RUNNER_WORKERS`).
 For automation/CI, use `--onboarding false`.
 

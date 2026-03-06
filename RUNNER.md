@@ -293,10 +293,12 @@ All workers must use `docs/memory/` as shared brain memory.
 - Required behavior for every claimed node:
   - Read `docs/memory/README.md` and relevant memory files before implementation.
   - If the node changes architecture, policy, API, schema, or acceptance evidence, update the relevant memory file(s) in the same task.
-  - If the node is completed successfully and changes files, create exactly one git commit for that node before calling `atp_complete_task`.
-  - Commit message format: `node(<NODE_ID>): <short title>`.
+  - Follow the runtime commit policy injected by ATP Runner.
+  - If runtime says commit-per-node is enabled and the node is completed successfully with file changes, create exactly one git commit before calling `atp_complete_task`.
+  - Commit message format when commits are enabled: `node(<NODE_ID>): <short title>`.
+  - If runtime says commit-per-node is disabled, do not create an automatic task commit; explain file changes in the task report instead.
   - If no files changed, do not commit; explain that explicitly in the task report.
-  - If commit creation is blocked by sandbox/permission constraints, do not fail the node solely for that blocker. Report the blocker and continue so runner-side commit enforcement can apply fallback.
+  - If commit creation is blocked by sandbox/permission constraints while commits are enabled, do not fail the node solely for that blocker. Report the blocker and continue so runner-side commit enforcement can apply fallback.
   - Every memory update must append an entry with:
     - `NodeID`
     - `Date` (YYYY-MM-DD)

@@ -813,7 +813,7 @@ function readAgentProvider(args: CliArgs): AgentProvider {
   return provider as AgentProvider;
 }
 
-function resolveConfig(argv: string[]): RunnerConfig | null {
+export function resolveConfig(argv: string[]): RunnerConfig | null {
   const args = parseCliArgs(argv);
   if (args.help) {
     printHelp();
@@ -845,7 +845,7 @@ function resolveConfig(argv: string[]): RunnerConfig | null {
   const providerExplicit = hasExplicitOption(args, "agent-provider", "ATP_RUNNER_AGENT_PROVIDER");
   const reasoningExplicit = hasExplicitOption(args, "reasoning-effort", "ATP_RUNNER_REASONING_EFFORT");
   const sandboxExplicit = hasExplicitOption(args, "sandbox-mode", "ATP_RUNNER_SANDBOX_MODE");
-  const modelDefault = agentProvider === "claude" ? "sonnet" : "gpt-5.3-codex";
+  const modelDefault = agentProvider === "claude" ? "sonnet" : "gpt-5.4";
   const model = readStringOption(args, "model", "ATP_RUNNER_MODEL", modelDefault);
   const claudeBinary = readStringOption(args, "claude-bin", "ATP_RUNNER_CLAUDE_BIN", "claude");
   const reasoningEffort = readReasoningEffort(args);
@@ -1393,7 +1393,7 @@ async function runOnboarding(config: RunnerConfig): Promise<RunnerConfig> {
           stepIndex += 1;
           break;
         }
-        const recommended = next.agentProvider === "claude" ? "sonnet" : "gpt-5.3-codex";
+        const recommended = next.agentProvider === "claude" ? "sonnet" : "gpt-5.4";
         const modelOptions: ArrowMenuOption<string>[] = [
           { label: `Keep current model (${next.model})`, value: next.model },
         ];
@@ -1627,7 +1627,7 @@ Options:
   --max-error-rounds <n>     Abort after N all-error rounds (default: 3)
   --agent-provider <name>    codex|claude (default: codex)
   --agent-prefix <text>      Prefix used to generate per-worker agent IDs (default: codex_agent)
-  --model <name>             Model name (default: gpt-5.3-codex for codex, sonnet for claude)
+  --model <name>             Model name (default: gpt-5.4 for codex, sonnet for claude)
   --reasoning-effort <mode>  minimal|low|medium|high|xhigh (default: high)
   --sandbox-mode <mode>      read-only|workspace-write|danger-full-access (default: workspace-write)
   --claude-bin <path>        Claude CLI binary/command (default: claude)
@@ -2153,7 +2153,7 @@ function extractAssignment(text: string): { nodeId: string; title: string } | nu
   };
 }
 
-function buildWorkerPrompt(
+export function buildWorkerPrompt(
   promptTemplate: string,
   runtime: {
     projectRoot: string;
@@ -2193,7 +2193,10 @@ function buildWorkerPrompt(
           "- If no files changed for a successfully completed node, state this explicitly in the report instead of committing.",
           "- If commit is blocked by sandbox/permissions, do not fail the node solely for that. Continue, report the commit blocker clearly, and let runner-side commit enforcement handle fallback.",
         ]
-      : []),
+      : [
+          "- Do not create git commits as part of normal node completion unless the human explicitly asks for one.",
+          "- Complete the node via atp_complete_task without making an automatic task commit, even if files changed.",
+        ]),
     "- Use web search whenever the task depends on fast-changing external docs/APIs/SDKs, and cite sources in the completion report.",
     "- Before calling atp_complete_task with status DONE, run lint and typecheck appropriate for the files/systems touched in this node.",
     "- If lint/typecheck fails, attempt autofixes first (do not immediately fail). Rerun checks after applying fixes.",
@@ -2217,6 +2220,14 @@ function buildWorkerPrompt(
     .replaceAll("{{AGENT_ID}}", runtime.agentId);
 
   return `${runtimePreamble}\n\n${hydratedPrompt}`;
+}
+
+function isMainModule(metaUrl: string): boolean {
+  const entry = process.argv[1];
+  if (!entry) {
+    return false;
+  }
+  return path.resolve(entry) === fileURLToPath(metaUrl);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -2954,10 +2965,12 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error) => {
-  if (process.stdout.isTTY) {
-    process.stdout.write(CURSOR_SHOW);
-  }
-  console.error("Fatal error:", error);
-  process.exit(1);
-});
+if (isMainModule(import.meta.url)) {
+  main().catch((error) => {
+    if (process.stdout.isTTY) {
+      process.stdout.write(CURSOR_SHOW);
+    }
+    console.error("Fatal error:", error);
+    process.exit(1);
+  });
+}

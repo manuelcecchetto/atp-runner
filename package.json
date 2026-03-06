@@ -5,10 +5,11 @@
   "description": "Headless ATP Task Runner",
   "type": "module",
   "scripts": {
-    "start": "tsx atp_runner.ts"
+    "start": "tsx atp_runner.ts",
+    "test": "node --import tsx --test atp_runner.test.ts"
   },
   "dependencies": {
-    "@openai/codex-sdk": "^0.98.0",
+    "@openai/codex-sdk": "^0.111.0",
     "tsx": "^4.21.0"
   },
   "devDependencies": {
