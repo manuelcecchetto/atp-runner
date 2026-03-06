@@ -6,7 +6,10 @@
   "type": "module",
   "scripts": {
     "start": "tsx atp_runner.ts",
-    "test": "node --import tsx --test atp_runner.test.ts"
+    "test": "node --import tsx --test atp_runner.test.ts atp_symphony_bridge.test.ts symphony_workflow.test.ts atp_intake.test.ts atp_symphony_service.test.ts",
+    "symphony:bridge": "tsx atp_symphony_bridge.ts",
+    "symphony:service": "tsx atp_symphony_service.ts",
+    "atp:intake": "tsx atp_intake.ts"
   },
   "dependencies": {
     "@openai/codex-sdk": "^0.111.0",
