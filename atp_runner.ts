@@ -30,7 +30,9 @@ const ALLOWED_SANDBOX_MODES: ReadonlySet<SandboxMode> = new Set([
 ]);
 const ALLOWED_WEB_SEARCH_MODES: ReadonlySet<WebSearchMode> = new Set(["disabled", "cached", "live"]);
 const ALLOWED_AGENT_PROVIDERS = new Set(["codex", "claude"] as const);
+const ALLOWED_JUDGE_MODES = new Set(["strict", "adaptive-dry-run", "adaptive"] as const);
 type AgentProvider = "codex" | "claude";
+type JudgeMode = "strict" | "adaptive-dry-run" | "adaptive";
 
 type WorkerOutcomeKind = "ACTIVITY" | "NO_TASKS_AVAILABLE" | "PROJECT_INACTIVE" | "ERROR";
 type WorkerPhase = "QUEUED" | "RUNNING" | "FINISHED";
@@ -100,6 +102,7 @@ interface RunnerConfig {
   commitPerNodeExplicit: boolean;
   reasoningExplicit: boolean;
   sandboxExplicit: boolean;
+  judgeModeExplicit: boolean;
   workers: number;
   commitPerNode: boolean;
   webSearchMode: WebSearchMode;
@@ -111,6 +114,8 @@ interface RunnerConfig {
   model: string;
   reasoningEffort: ModelReasoningEffort;
   sandboxMode: SandboxMode;
+  judgeMode: JudgeMode;
+  judgeLogFile: string;
   tuiEnabled: boolean;
   onboardingEnabled: boolean;
   claudeBinary: string;
@@ -147,6 +152,18 @@ interface SignalState {
   sawFileChange: boolean;
   assignedNodeId: string | null;
   assignedTitle: string | null;
+}
+
+interface JudgeRunContext {
+  round: number;
+  summary: RoundSummary;
+}
+
+interface JudgeResult {
+  status: "SKIPPED" | "NO_CHANGE" | "PROPOSED_PATCH" | "PATCH_APPLIED" | "ERROR" | "UNPARSEABLE";
+  details: string;
+  decision?: Record<string, unknown>;
+  rawOutput: string;
 }
 
 const ANSI = {
@@ -796,6 +813,16 @@ function readWebSearchMode(args: CliArgs): WebSearchMode {
   return mode as WebSearchMode;
 }
 
+function readJudgeMode(args: CliArgs): JudgeMode {
+  const mode = readStringOption(args, "judge-mode", "ATP_RUNNER_JUDGE_MODE", "strict");
+  if (!ALLOWED_JUDGE_MODES.has(mode as JudgeMode)) {
+    throw new Error(
+      `Unsupported judge mode "${mode}". Allowed: ${Array.from(ALLOWED_JUDGE_MODES).join(", ")}.`,
+    );
+  }
+  return mode as JudgeMode;
+}
+
 function hasExplicitOption(args: CliArgs, key: string, envKey: string): boolean {
   const fromCli = args[key];
   if (typeof fromCli === "string" || fromCli === true) {
@@ -845,11 +872,21 @@ export function resolveConfig(argv: string[]): RunnerConfig | null {
   const providerExplicit = hasExplicitOption(args, "agent-provider", "ATP_RUNNER_AGENT_PROVIDER");
   const reasoningExplicit = hasExplicitOption(args, "reasoning-effort", "ATP_RUNNER_REASONING_EFFORT");
   const sandboxExplicit = hasExplicitOption(args, "sandbox-mode", "ATP_RUNNER_SANDBOX_MODE");
+  const judgeModeExplicit = hasExplicitOption(args, "judge-mode", "ATP_RUNNER_JUDGE_MODE");
   const modelDefault = agentProvider === "claude" ? "sonnet" : "gpt-5.4";
   const model = readStringOption(args, "model", "ATP_RUNNER_MODEL", modelDefault);
   const claudeBinary = readStringOption(args, "claude-bin", "ATP_RUNNER_CLAUDE_BIN", "claude");
   const reasoningEffort = readReasoningEffort(args);
   const sandboxMode = readSandboxMode(args);
+  const judgeMode = readJudgeMode(args);
+  const judgeLogFile = path.resolve(
+    readStringOption(
+      args,
+      "judge-log",
+      "ATP_RUNNER_JUDGE_LOG",
+      path.join(projectRoot, ".atp", "judge.ndjson"),
+    ),
+  );
 
   const noTui = readBooleanOption(args, "no-tui", "ATP_RUNNER_NO_TUI", false);
 
@@ -873,10 +910,13 @@ export function resolveConfig(argv: string[]): RunnerConfig | null {
     commitPerNodeExplicit,
     reasoningExplicit,
     sandboxExplicit,
+    judgeModeExplicit,
     agentPrefix,
     model,
     reasoningEffort,
     sandboxMode,
+    judgeMode,
+    judgeLogFile,
     tuiEnabled: !noTui,
     onboardingEnabled,
     claudeBinary,
@@ -1630,6 +1670,8 @@ Options:
   --model <name>             Model name (default: gpt-5.4 for codex, sonnet for claude)
   --reasoning-effort <mode>  minimal|low|medium|high|xhigh (default: high)
   --sandbox-mode <mode>      read-only|workspace-write|danger-full-access (default: workspace-write)
+  --judge-mode <mode>        strict|adaptive-dry-run|adaptive (default: strict)
+  --judge-log <path>         NDJSON audit log for adaptive judge decisions (default: <project-root>/.atp/judge.ndjson)
   --claude-bin <path>        Claude CLI binary/command (default: claude)
   --onboarding <bool>        Interactive startup agent/model selection in TUI (default: true)
   --no-tui                   Disable the live color dashboard and use plain logs
@@ -2038,6 +2080,20 @@ function stringifyUnknown(value: unknown): string {
   }
 }
 
+function collectStringLeaves(value: unknown, bucket: string[]): void {
+  if (typeof value === "string") {
+    bucket.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((entry) => collectStringLeaves(entry, bucket));
+    return;
+  }
+  if (value && typeof value === "object") {
+    Object.values(value).forEach((entry) => collectStringLeaves(entry, bucket));
+  }
+}
+
 function truncate(value: unknown, maxLength = 2000): string {
   const text = stringifyUnknown(value);
   if (text.length <= maxLength) {
@@ -2166,6 +2222,7 @@ export function buildWorkerPrompt(
     commitPerNode: boolean;
     hasPreCommit: boolean;
     hasRuff: boolean;
+    judgeMode: JudgeMode;
   },
 ): string {
   const runtimePreamble = [
@@ -2212,6 +2269,12 @@ export function buildWorkerPrompt(
       : []),
     "- Only mark FAILED for lint/typecheck when issues are not fixable within scope (provide concrete errors).",
     "- Include which lint/typecheck commands were run and their results (or failure reason) in the completion report.",
+    ...(runtime.judgeMode !== "strict"
+      ? [
+          "- A post-node adaptive judge consumes node reports between runner turns. Structure completion reports with clear sections for: Outcome, Facts Learned, Decisions Made, Files Touched, Interfaces Changed, Verification, Risks, Recommended Next Step.",
+          "- If a section is empty, say so explicitly instead of omitting it. Future graph changes depend on these handoffs.",
+        ]
+      : []),
   ].join("\n");
 
   const hydratedPrompt = promptTemplate
@@ -2220,6 +2283,65 @@ export function buildWorkerPrompt(
     .replaceAll("{{AGENT_ID}}", runtime.agentId);
 
   return `${runtimePreamble}\n\n${hydratedPrompt}`;
+}
+
+export function buildJudgePrompt(input: {
+  projectRoot: string;
+  atpFile: string;
+  judgeMode: Exclude<JudgeMode, "strict">;
+  round: number;
+  summary: RoundSummary;
+  agentId: string;
+}): string {
+  const modeSpecificStep =
+    input.judgeMode === "adaptive"
+      ? `7. If a bounded future patch is justified, call atp_apply_future_patch(plan_path="", expected_graph_version=<graph_version>, patch=<patch>, reason=<brief rationale>, actor_id="${input.agentId}").`
+      : "7. Do not call atp_apply_future_patch in this mode. Only propose a bounded future patch if one is justified.";
+
+  const modeSpecificStatus =
+    input.judgeMode === "adaptive"
+      ? '- Use `status: "PATCH_APPLIED"` only after a successful `atp_apply_future_patch` call.'
+      : '- Use `status: "PROPOSED_PATCH"` when you recommend a future patch in dry-run mode.';
+
+  return [
+    "You are the ATP Adaptive Judge.",
+    "",
+    "Your job is to inspect the current ATP graph after the latest worker round and decide whether future unclaimed work should be reshaped.",
+    "",
+    "### Runtime Context",
+    `- project_root: ${input.projectRoot}`,
+    `- plan_path: ${input.atpFile}`,
+    `- judge_mode: ${input.judgeMode}`,
+    `- runner_round: ${input.round}`,
+    `- judge_agent_id: ${input.agentId}`,
+    `- round_summary: ${JSON.stringify(input.summary)}`,
+    "",
+    "### Hard Constraints",
+    "- Work from the ATP graph only. Do not inspect the repository, run shell commands, or use web search.",
+    '- Call `atp_read_graph(plan_path="", view_mode="full")` before making any decision.',
+    "- Parse the returned JSON and extract `meta.graph_version` plus the current node statuses.",
+    "- If any nodes are still CLAIMED, stop and return a SKIPPED decision. Do not mutate the graph.",
+    "- Read completed/failed node reports from the graph and treat those reports as the source of facts learned.",
+    "- Only reason about future nodes: READY or LOCKED nodes that are not already terminal and do not have `future_state` set to CLOSED or SUPERSEDED.",
+    "- Allowed future patch operations: `add_nodes`, `update_nodes`, `rewire_edges`, `close_nodes`.",
+    "- Never touch CLAIMED, COMPLETED, FAILED, or SCOPE nodes.",
+    "",
+    "### Decision Procedure",
+    "1. Call `atp_read_graph(plan_path=\"\", view_mode=\"full\")`.",
+    "2. If claimed nodes exist, return a SKIPPED decision with the claimed node ids.",
+    "3. Decide whether the future graph still matches what completed/failed node reports now imply.",
+    "4. Prefer NO_CHANGE unless there is a concrete reason to improve future work.",
+    "5. If a patch is warranted, keep it bounded and explain why each operation is necessary.",
+    "6. Include `expected_graph_version` from the full graph in your decision JSON.",
+    modeSpecificStep,
+    "",
+    "### Final Output",
+    "Return exactly one compact JSON block between these markers at the end of your final message:",
+    "ATP_JUDGE_DECISION_JSON_START",
+    '{ "mode": "adaptive-dry-run|adaptive", "status": "SKIPPED|NO_CHANGE|PROPOSED_PATCH|PATCH_APPLIED|ERROR", "expected_graph_version": "<graph version or null>", "claimed_nodes": [], "rationale": "<short rationale>", "patch": {\"add_nodes\":[],\"update_nodes\":[],\"rewire_edges\":[],\"close_nodes\":[]} | null, "apply_result": "<tool result or null>" }',
+    "ATP_JUDGE_DECISION_JSON_END",
+    modeSpecificStatus,
+  ].join("\n");
 }
 
 function isMainModule(metaUrl: string): boolean {
@@ -2243,6 +2365,331 @@ function summarizeOutcomes(outcomes: WorkerOutcome[]): RoundSummary {
   }, createEmptySummary());
 }
 
+function extractJudgeDecision(rawOutput: string): Record<string, unknown> | null {
+  const match = rawOutput.match(/ATP_JUDGE_DECISION_JSON_START\s*([\s\S]*?)\s*ATP_JUDGE_DECISION_JSON_END/);
+  if (!match || !match[1]) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(match[1].trim()) as Record<string, unknown>;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function summarizeJudgeDecision(decision: Record<string, unknown>): string {
+  const status = typeof decision.status === "string" ? decision.status : "UNKNOWN";
+  const rationale = typeof decision.rationale === "string" ? decision.rationale : "";
+  const applyResult = typeof decision.apply_result === "string" ? decision.apply_result : "";
+
+  if (status === "SKIPPED") {
+    const claimedNodes = Array.isArray(decision.claimed_nodes)
+      ? decision.claimed_nodes.filter((value): value is string => typeof value === "string")
+      : [];
+    const suffix = claimedNodes.length > 0 ? ` (${claimedNodes.join(", ")})` : "";
+    return `Adaptive judge skipped${suffix}`;
+  }
+
+  if (status === "PATCH_APPLIED") {
+    return applyResult ? `Adaptive judge applied patch: ${truncatePlain(applyResult, 110)}` : "Adaptive judge applied a future patch";
+  }
+
+  if (status === "PROPOSED_PATCH") {
+    return rationale ? `Adaptive judge proposed patch: ${truncatePlain(rationale, 110)}` : "Adaptive judge proposed a future patch";
+  }
+
+  if (status === "NO_CHANGE") {
+    return rationale ? `Adaptive judge kept plan unchanged: ${truncatePlain(rationale, 110)}` : "Adaptive judge kept plan unchanged";
+  }
+
+  if (status === "ERROR") {
+    return rationale ? `Adaptive judge errored: ${truncatePlain(rationale, 110)}` : "Adaptive judge returned an error decision";
+  }
+
+  return "Adaptive judge returned an unrecognized decision";
+}
+
+function appendJudgeAuditLog(config: RunnerConfig, context: JudgeRunContext, result: JudgeResult): void {
+  const record = {
+    timestamp: new Date().toISOString(),
+    round: context.round,
+    mode: config.judgeMode,
+    provider: config.agentProvider,
+    plan_path: config.atpFile,
+    summary: context.summary,
+    result,
+  };
+
+  const targetDir = path.dirname(config.judgeLogFile);
+  fs.mkdirSync(targetDir, { recursive: true });
+  fs.appendFileSync(config.judgeLogFile, `${JSON.stringify(record)}\n`, "utf8");
+}
+
+async function runAdaptiveJudgeCodex(
+  config: RunnerConfig,
+  dashboard: RunnerDashboard,
+  context: JudgeRunContext,
+): Promise<JudgeResult> {
+  const judgeMode = config.judgeMode;
+  if (judgeMode === "strict") {
+    return {
+      status: "SKIPPED",
+      details: "Adaptive judge disabled",
+      rawOutput: "",
+    };
+  }
+
+  const workerId = `${config.agentPrefix}_judge_r${context.round}`;
+  const systemPrompt = buildJudgePrompt({
+    projectRoot: config.projectRoot,
+    atpFile: config.atpFile,
+    judgeMode,
+    round: context.round,
+    summary: context.summary,
+    agentId: workerId,
+  });
+
+  dashboard.logRunner(`Adaptive judge checkpoint started for round ${context.round}.`);
+
+  const env = toStringRecord(process.env, {
+    ATP_FILE: config.atpFile,
+    ATP_AGENT_ID: workerId,
+    ATP_WORKER_DIR: config.projectRoot,
+    ATP_WORKER_BRANCH: "runner-judge",
+    PYTHONUNBUFFERED: "1",
+  });
+
+  const client = new Codex({ env });
+  const thread = client.startThread({
+    sandboxMode: config.sandboxMode,
+    skipGitRepoCheck: true,
+    model: config.model,
+    modelReasoningEffort: config.reasoningEffort,
+    workingDirectory: config.projectRoot,
+    webSearchEnabled: false,
+    webSearchMode: "disabled",
+    additionalDirectories: [config.projectRoot, path.join(config.projectRoot, ".git")],
+  });
+
+  let rawOutput = "";
+  const abortController = new AbortController();
+  let abortedForTimeout = false;
+  const timeoutHandle = setTimeout(() => {
+    abortedForTimeout = true;
+    abortController.abort();
+  }, config.workerTimeoutMs);
+
+  try {
+    const streamResult = await thread.runStreamed(systemPrompt, { signal: abortController.signal });
+
+    for await (const event of streamResult.events) {
+      if (event.type === "item.completed" && event.item.type === "agent_message") {
+        rawOutput = `${rawOutput}\n${event.item.text ?? ""}`.trim();
+      }
+      if (event.type === "item.completed" && event.item.type === "mcp_tool_call") {
+        const toolName = event.item.tool;
+        dashboard.logRunner(`Adaptive judge tool: ${toolName}${event.item.error ? " (error)" : ""}`);
+      }
+    }
+  } catch (error) {
+    clearTimeout(timeoutHandle);
+    if (abortedForTimeout) {
+      return {
+        status: "ERROR",
+        details: `Adaptive judge timed out after ${config.workerTimeoutMs}ms`,
+        rawOutput,
+      };
+    }
+    const details = error instanceof Error ? error.message : String(error);
+    return {
+      status: "ERROR",
+      details: truncatePlain(details, 160),
+      rawOutput,
+    };
+  }
+
+  clearTimeout(timeoutHandle);
+  const decision = extractJudgeDecision(rawOutput);
+  if (!decision) {
+    return {
+      status: "UNPARSEABLE",
+      details: "Adaptive judge finished without a parsable decision block",
+      rawOutput,
+    };
+  }
+
+  const status = typeof decision.status === "string" ? decision.status : "UNPARSEABLE";
+  return {
+    status:
+      status === "SKIPPED" || status === "NO_CHANGE" || status === "PROPOSED_PATCH" || status === "PATCH_APPLIED" || status === "ERROR"
+        ? status
+        : "UNPARSEABLE",
+    details: summarizeJudgeDecision(decision),
+    decision,
+    rawOutput,
+  };
+}
+
+async function runAdaptiveJudgeClaude(
+  config: RunnerConfig,
+  dashboard: RunnerDashboard,
+  context: JudgeRunContext,
+): Promise<JudgeResult> {
+  const judgeMode = config.judgeMode;
+  if (judgeMode === "strict") {
+    return {
+      status: "SKIPPED",
+      details: "Adaptive judge disabled",
+      rawOutput: "",
+    };
+  }
+
+  const workerId = `${config.agentPrefix}_judge_r${context.round}`;
+  const systemPrompt = buildJudgePrompt({
+    projectRoot: config.projectRoot,
+    atpFile: config.atpFile,
+    judgeMode,
+    round: context.round,
+    summary: context.summary,
+    agentId: workerId,
+  });
+
+  dashboard.logRunner(`Adaptive judge checkpoint started for round ${context.round}.`);
+
+  const env = toStringRecord(process.env, {
+    ATP_FILE: config.atpFile,
+    ATP_AGENT_ID: workerId,
+    ATP_WORKER_DIR: config.projectRoot,
+    ATP_WORKER_BRANCH: "runner-judge",
+    PYTHONUNBUFFERED: "1",
+  });
+
+  const args = [
+    "-p",
+    "Execute one ATP adaptive judge turn now. Follow the appended system prompt exactly.",
+    "--append-system-prompt",
+    systemPrompt,
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--permission-mode",
+    "bypassPermissions",
+    "--dangerously-skip-permissions",
+    "--model",
+    config.model,
+  ];
+
+  const child = spawn(config.claudeBinary, args, {
+    cwd: config.projectRoot,
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  let rawOutput = "";
+  let stderrText = "";
+  let abortedForTimeout = false;
+  const timeoutHandle = setTimeout(() => {
+    abortedForTimeout = true;
+    child.kill("SIGTERM");
+    setTimeout(() => {
+      if (!child.killed) {
+        child.kill("SIGKILL");
+      }
+    }, 1500);
+  }, config.workerTimeoutMs);
+
+  child.stderr.on("data", (chunk) => {
+    stderrText = `${stderrText}${String(chunk)}`.slice(-4000);
+  });
+
+  const stdoutLines = readline.createInterface({ input: child.stdout });
+  stdoutLines.on("line", (line) => {
+    if (!line.trim()) {
+      return;
+    }
+    try {
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      const strings: string[] = [];
+      collectStringLeaves(parsed, strings);
+      if (strings.length > 0) {
+        rawOutput = `${rawOutput}\n${strings.join("\n")}`.trim();
+        return;
+      }
+    } catch {
+      // Fall back to raw output for any non-JSON line.
+    }
+    rawOutput = `${rawOutput}\n${line}`.trim();
+  });
+
+  let exitCode: number | null;
+  try {
+    exitCode = await new Promise<number | null>((resolve, reject) => {
+      child.on("error", reject);
+      child.on("close", (code) => resolve(code));
+    });
+  } catch (error) {
+    clearTimeout(timeoutHandle);
+    const details = error instanceof Error ? error.message : String(error);
+    return {
+      status: "ERROR",
+      details: truncatePlain(`Failed to launch Claude judge: ${details}`, 160),
+      rawOutput,
+    };
+  }
+
+  clearTimeout(timeoutHandle);
+
+  if (abortedForTimeout) {
+    return {
+      status: "ERROR",
+      details: `Adaptive judge timed out after ${config.workerTimeoutMs}ms`,
+      rawOutput,
+    };
+  }
+
+  if ((exitCode ?? 1) !== 0) {
+    const detail = stderrText.trim().split(/\r?\n/).filter(Boolean).at(-1) ?? `Claude judge exited with code ${exitCode}`;
+    return {
+      status: "ERROR",
+      details: truncatePlain(detail, 160),
+      rawOutput,
+    };
+  }
+
+  const decision = extractJudgeDecision(rawOutput);
+  if (!decision) {
+    return {
+      status: "UNPARSEABLE",
+      details: "Adaptive judge finished without a parsable decision block",
+      rawOutput,
+    };
+  }
+
+  const status = typeof decision.status === "string" ? decision.status : "UNPARSEABLE";
+  return {
+    status:
+      status === "SKIPPED" || status === "NO_CHANGE" || status === "PROPOSED_PATCH" || status === "PATCH_APPLIED" || status === "ERROR"
+        ? status
+        : "UNPARSEABLE",
+    details: summarizeJudgeDecision(decision),
+    decision,
+    rawOutput,
+  };
+}
+
+async function runAdaptiveJudge(
+  config: RunnerConfig,
+  dashboard: RunnerDashboard,
+  context: JudgeRunContext,
+): Promise<JudgeResult> {
+  if (config.agentProvider === "claude") {
+    return runAdaptiveJudgeClaude(config, dashboard, context);
+  }
+  return runAdaptiveJudgeCodex(config, dashboard, context);
+}
+
 async function runOneTaskCodex(
   config: RunnerConfig,
   promptTemplate: string,
@@ -2261,6 +2708,7 @@ async function runOneTaskCodex(
     commitPerNode: config.commitPerNode,
     hasPreCommit: runtime.hasPreCommit,
     hasRuff: runtime.hasRuff,
+    judgeMode: config.judgeMode,
   });
 
   dashboard.markWorkerStarted(workerId, `Launching Codex thread in ${runtime.workingDirectory}...`);
@@ -2616,6 +3064,7 @@ async function runOneTaskClaude(
     commitPerNode: config.commitPerNode,
     hasPreCommit: runtime.hasPreCommit,
     hasRuff: runtime.hasRuff,
+    judgeMode: config.judgeMode,
   });
 
   dashboard.markWorkerStarted(workerId, `Launching Claude turn in ${runtime.workingDirectory}...`);
@@ -2889,6 +3338,10 @@ async function main(): Promise<void> {
     );
     dashboard.logRunner(`Parallel workers: ${config.workers}`);
     dashboard.logRunner(`Commit per node: ${config.commitPerNode ? "enabled" : "disabled"}`);
+    dashboard.logRunner(`Adaptive judge: ${config.judgeMode}`);
+    if (config.judgeMode !== "strict") {
+      dashboard.logRunner(`Judge log: ${config.judgeLogFile}`);
+    }
     dashboard.logRunner(`Web search mode: ${config.webSearchMode}`);
     dashboard.logRunner(`Worker timeout: ${config.workerTimeoutMs}ms`);
     if (config.workers > 1) {
@@ -2940,6 +3393,15 @@ async function main(): Promise<void> {
       }
 
       dashboard.finishRound(summary, idleRounds, allErrorRounds);
+
+      if (!exiting && config.judgeMode !== "strict" && summary.PROJECT_INACTIVE === 0 && summary.ACTIVITY > 0) {
+        const judgeResult = await runAdaptiveJudge(config, dashboard, { round, summary });
+        appendJudgeAuditLog(config, { round, summary }, judgeResult);
+        dashboard.logRunner(
+          judgeResult.details,
+          judgeResult.status === "ERROR" || judgeResult.status === "UNPARSEABLE" ? "warn" : "info",
+        );
+      }
 
       if (summary.PROJECT_INACTIVE > 0) {
         break;

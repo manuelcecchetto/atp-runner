@@ -168,6 +168,15 @@ Your typical loop is:
        - What verification you ran and the outcome.
        - Any known limitations, follow-up work, or unresolved risks.
        - How to manually verify completion when relevant.
+       - When the runner is using adaptive judge modes, keep the report easy to promote into future planning:
+         - `Outcome`
+         - `Facts Learned`
+         - `Decisions Made`
+         - `Files Touched`
+         - `Interfaces Changed`
+         - `Verification`
+         - `Risks`
+         - `Recommended Next Step`
      - Build an `artifacts` list of paths for key files you touched or created (optional but recommended).
 
    - Mark the task complete:
