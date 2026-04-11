@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
-import { buildJudgePrompt, buildWorkerPrompt, resolveConfig } from "./atp_runner.ts";
+import { buildJudgePrompt, buildWorkerPrompt, claimTaskLocally, resolveConfig } from "./atp_runner.ts";
 
 const runnerTemplate = fs.readFileSync(new URL("./RUNNER.md", import.meta.url), "utf8");
 
@@ -18,6 +19,20 @@ const baseRuntime = {
   hasPreCommit: false,
   hasRuff: false,
   judgeMode: "strict" as const,
+  claimedTask: {
+    nodeId: "T01",
+    title: "Implement deterministic claim path",
+    assignmentBlock: [
+      "TASK ASSIGNED: T01 - Implement deterministic claim path",
+      "STATUS: CLAIMED",
+      "INSTRUCTION:",
+      "Make the runner claim locally before launching the worker.",
+      "CONTEXT FROM DEPENDENCIES:",
+      "- No parent context; follow the instruction directly.",
+      "DOWNSTREAM CHILDREN:",
+      "- T02 (LOCKED): Document the runner contract",
+    ].join("\n"),
+  },
 };
 
 test("buildWorkerPrompt enforces commit-per-node when enabled", () => {
@@ -38,6 +53,18 @@ test("buildWorkerPrompt forbids automatic task commits when disabled", () => {
 
   assert.match(prompt, /Do not create git commits as part of normal node completion/i);
   assert.match(prompt, /Complete the node via atp_complete_task without making an automatic task commit, even if files changed/i);
+});
+
+test("buildWorkerPrompt injects the claimed task packet and forbids re-claiming", () => {
+  const prompt = buildWorkerPrompt(runnerTemplate, {
+    ...baseRuntime,
+    commitPerNode: false,
+  });
+
+  assert.match(prompt, /claimed_node_id: T01/i);
+  assert.match(prompt, /runner has already claimed exactly one node for you/i);
+  assert.match(prompt, /Do not call atp_claim_task in this turn/i);
+  assert.match(prompt, /TASK ASSIGNED: T01 - Implement deterministic claim path/i);
 });
 
 test("buildWorkerPrompt adds adaptive judge handoff guidance when enabled", () => {
@@ -121,4 +148,73 @@ test("resolveConfig honors adaptive judge flags", () => {
   assert.equal(config.judgeMode, "adaptive");
   assert.equal(config.judgeModeExplicit, true);
   assert.equal(config.judgeLogFile, path.resolve("logs/judge.ndjson"));
+});
+
+test("claimTaskLocally deterministically claims the lowest-dependency ready node", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "atp-runner-claim-"));
+  const planPath = path.join(tempDir, ".atp.json");
+  fs.writeFileSync(
+    planPath,
+    JSON.stringify(
+      {
+        meta: {
+          project_status: "ACTIVE",
+        },
+        nodes: {
+          T02: {
+            title: "Dependent work",
+            instruction: "Do dependent work",
+            status: "READY",
+            dependencies: ["T01"],
+            artifacts: [],
+          },
+          T01: {
+            title: "First work item",
+            instruction: "Do first work item",
+            status: "READY",
+            dependencies: [],
+            artifacts: [],
+          },
+        },
+      },
+      null,
+      2,
+    ),
+  );
+
+  const claim = await claimTaskLocally(planPath, "codex_agent_1");
+  assert.equal(claim.kind, "ASSIGNED");
+  if (claim.kind !== "ASSIGNED") {
+    return;
+  }
+  assert.equal(claim.task.nodeId, "T01");
+  assert.match(claim.task.assignmentBlock, /DOWNSTREAM CHILDREN:/);
+
+  const updatedPlan = JSON.parse(fs.readFileSync(planPath, "utf8"));
+  assert.equal(updatedPlan.nodes.T01.status, "CLAIMED");
+  assert.equal(updatedPlan.nodes.T01.worker_id, "codex_agent_1");
+});
+
+test("claimTaskLocally returns project inactive without mutating the plan", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "atp-runner-inactive-"));
+  const planPath = path.join(tempDir, ".atp.json");
+  const initialPlan = {
+    meta: {
+      project_status: "DRAFT",
+    },
+    nodes: {
+      T01: {
+        title: "Draft work item",
+        instruction: "Do draft work item",
+        status: "READY",
+        dependencies: [],
+        artifacts: [],
+      },
+    },
+  };
+  fs.writeFileSync(planPath, JSON.stringify(initialPlan, null, 2));
+
+  const claim = await claimTaskLocally(planPath, "codex_agent_1");
+  assert.equal(claim.kind, "PROJECT_INACTIVE");
+  assert.equal(JSON.parse(fs.readFileSync(planPath, "utf8")).nodes.T01.status, "READY");
 });

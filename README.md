@@ -10,17 +10,17 @@ This repo provides:
 ## What This Is
 
 `atp-runner` executes ATP plans by spawning worker sessions that:
-- claim tasks from an ATP MCP server
+- claim tasks locally and deterministically from the ATP plan
 - implement changes in the target repo
-- complete or decompose ATP nodes
+- complete or decompose ATP nodes through ATP MCP tools
 
-The runner injects runtime context (agent id, plan path, worker metadata) into `RUNNER.md`.
+The runner injects runtime context plus the already-claimed task packet (instruction, dependency handoff, bounded neighborhood context) into `RUNNER.md`.
 
 ## Requirements
 
 - Node.js 18+
 - An ATP plan file (default: `.atp.json`)
-- MCP access to an ATP server (for ATP tools)
+- MCP access to an ATP server (for complete/decompose/read tools and adaptive judge patching)
 - For `claude` provider: Claude Code CLI installed and authenticated
 
 ## Install
@@ -76,6 +76,18 @@ npm start -- \
 ```
 
 In adaptive modes, the runner launches a short ATP v1.4 judge turn after active worker rounds. The judge reads the full ATP graph, skips if any nodes remain claimed, and either proposes or applies bounded future-graph patches through the ATP MCP server.
+
+## Claim Model
+
+The runner does not spend model turns retrieving work. Before each worker turn it:
+
+- reads the local ATP plan
+- revives stale claims and refreshes `LOCKED -> READY`
+- deterministically selects one claimable node
+- writes the `CLAIMED` state back to the plan
+- injects the exact claim packet into the worker prompt
+
+Workers should treat that injected packet as authoritative for the turn and should not call `atp_claim_task` during normal runner-managed execution.
 
 ## Browser Testing Runs
 

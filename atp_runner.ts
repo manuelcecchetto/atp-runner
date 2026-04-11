@@ -1,14 +1,15 @@
 import { Codex, type ModelReasoningEffort, type SandboxMode, type WebSearchMode } from "@openai/codex-sdk";
-import * as fs from "fs";
-import * as path from "path";
-import * as readline from "readline";
-import { execFileSync, spawn } from "child_process";
-import { stripVTControlCharacters } from "util";
-import { fileURLToPath } from "url";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as readline from "node:readline";
+import { execFileSync, spawn } from "node:child_process";
+import { stripVTControlCharacters } from "node:util";
+import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_PROMPT_FILE = path.join(__dirname, "RUNNER.md");
 
+const ATP_LEASE_SECONDS = Number.parseInt(process.env.ATP_LEASE_SECONDS ?? "600", 10) || 600;
 const STOP_NO_TASKS = "NO_TASKS_AVAILABLE";
 const STOP_PROJECT_INACTIVE = "Project is not ACTIVE";
 const TASK_ASSIGNED_MARKER = "TASK ASSIGNED:";
@@ -165,6 +166,53 @@ interface JudgeResult {
   decision?: Record<string, unknown>;
   rawOutput: string;
 }
+
+interface AtpNode {
+  title: string;
+  instruction: string;
+  status: string;
+  dependencies?: string[];
+  type?: string;
+  context?: string;
+  report?: string;
+  artifacts?: string[];
+  scope_children?: string[];
+  future_state?: string | null;
+  worker_id?: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  lease_expires_at?: string | null;
+  [key: string]: unknown;
+}
+
+interface AtpGraph {
+  meta?: Record<string, unknown>;
+  nodes: Record<string, AtpNode>;
+  [key: string]: unknown;
+}
+
+interface ClaimedTask {
+  nodeId: string;
+  title: string;
+  assignmentBlock: string;
+}
+
+type LocalClaimResult =
+  | {
+      kind: "ASSIGNED";
+      task: ClaimedTask;
+      notes: string[];
+    }
+  | {
+      kind: "NO_TASKS_AVAILABLE";
+      message: string;
+      notes: string[];
+    }
+  | {
+      kind: "PROJECT_INACTIVE";
+      message: string;
+      projectStatus: string | null;
+    };
 
 const ANSI = {
   reset: "\x1b[0m",
@@ -2223,6 +2271,7 @@ export function buildWorkerPrompt(
     hasPreCommit: boolean;
     hasRuff: boolean;
     judgeMode: JudgeMode;
+    claimedTask: ClaimedTask;
   },
 ): string {
   const runtimePreamble = [
@@ -2238,11 +2287,19 @@ export function buildWorkerPrompt(
     "",
     "Use these runtime values for ATP tool calls in this thread.",
     "",
+    "### Claimed Task Packet (Injected by ATP Runner)",
+    `- claimed_node_id: ${runtime.claimedTask.nodeId}`,
+    `- claimed_node_title: ${runtime.claimedTask.title}`,
+    "- The runner has already claimed exactly one node for you. Do not call atp_claim_task in this turn.",
+    "- If you complete or decompose this node, stop. The runner will handle the next claim in a later round.",
+    "- If you need more graph context, prefer atp_read_graph(plan_path=\"\", view_mode=\"local\", node_id=<claimed_node_id>) rather than re-claiming.",
+    "",
+    runtime.claimedTask.assignmentBlock,
+    "",
     "### Runtime Turn Rules (Hard Constraints)",
-    "- Claim at most one task in this turn.",
-    "- If claim returns NO_TASKS_AVAILABLE or Project is not ACTIVE, exit immediately with a short status message.",
-    "- Do not run repository exploration commands (find/rg/ls/etc.) if no task was assigned.",
-    "- After completing or decomposing one assigned task, end this turn immediately.",
+    "- Execute only the injected claimed node in this turn.",
+    "- Do not run repository exploration commands that are unrelated to the injected node scope.",
+    "- After completing or decomposing the injected node, end this turn immediately.",
     ...(runtime.commitPerNode
       ? [
           "- When a node is completed successfully with file changes, create exactly one git commit before calling atp_complete_task.",
@@ -2280,7 +2337,9 @@ export function buildWorkerPrompt(
   const hydratedPrompt = promptTemplate
     .replaceAll("{{PROJECT_ROOT}}", runtime.projectRoot)
     .replaceAll("{{PLAN_PATH}}", runtime.atpFile)
-    .replaceAll("{{AGENT_ID}}", runtime.agentId);
+    .replaceAll("{{AGENT_ID}}", runtime.agentId)
+    .replaceAll("{{CLAIMED_NODE_ID}}", runtime.claimedTask.nodeId)
+    .replaceAll("{{CLAIMED_NODE_TITLE}}", runtime.claimedTask.title);
 
   return `${runtimePreamble}\n\n${hydratedPrompt}`;
 }
@@ -2355,6 +2414,271 @@ function isMainModule(metaUrl: string): boolean {
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
+  });
+}
+
+function parseAtpTimestamp(value: unknown): number | null {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return null;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isoNow(date: Date): string {
+  return date.toISOString();
+}
+
+function projectIsActive(graph: AtpGraph): boolean {
+  return graph.meta?.project_status === "ACTIVE";
+}
+
+function dependenciesSatisfied(nodes: Record<string, AtpNode>, dependencies: string[]): boolean {
+  return dependencies.every((dependencyId) => nodes[dependencyId]?.status === "COMPLETED");
+}
+
+function nodeIsClosed(node: AtpNode): boolean {
+  return node.future_state === "CLOSED" || node.future_state === "SUPERSEDED";
+}
+
+function clearWorker(node: AtpNode): void {
+  delete node.worker_id;
+  node.lease_expires_at = null;
+}
+
+function extendLease(node: AtpNode, now: Date): void {
+  node.lease_expires_at = new Date(now.getTime() + ATP_LEASE_SECONDS * 1000).toISOString();
+}
+
+function findChildren(nodes: Record<string, AtpNode>, nodeId: string): string[] {
+  return Object.entries(nodes)
+    .filter(([, node]) => Array.isArray(node.dependencies) && node.dependencies.includes(nodeId))
+    .map(([childId]) => childId);
+}
+
+function refreshReadyNodes(graph: AtpGraph): string[] {
+  const unblocked: string[] = [];
+  for (const [nodeId, node] of Object.entries(graph.nodes)) {
+    if (node.type === "SCOPE" || nodeIsClosed(node) || node.status !== "LOCKED") {
+      continue;
+    }
+    const dependencies = Array.isArray(node.dependencies) ? node.dependencies : [];
+    if (dependenciesSatisfied(graph.nodes, dependencies)) {
+      node.status = "READY";
+      unblocked.push(nodeId);
+    }
+  }
+  return unblocked;
+}
+
+function releaseZombieClaims(graph: AtpGraph, now: Date): string[] {
+  const revived: string[] = [];
+  const nowMs = now.getTime();
+  for (const [nodeId, node] of Object.entries(graph.nodes)) {
+    if (node.type === "SCOPE" || node.status !== "CLAIMED") {
+      continue;
+    }
+    let deadlineMs = parseAtpTimestamp(node.lease_expires_at);
+    if (deadlineMs === null) {
+      const startedAt = parseAtpTimestamp(node.started_at);
+      if (startedAt !== null) {
+        deadlineMs = startedAt + ATP_LEASE_SECONDS * 1000;
+      }
+    }
+    if (deadlineMs !== null && nowMs > deadlineMs) {
+      node.status = "READY";
+      clearWorker(node);
+      revived.push(nodeId);
+    }
+  }
+  return revived;
+}
+
+function maybeCompleteScopes(graph: AtpGraph, now: Date): string[] {
+  const closed: string[] = [];
+  for (const [nodeId, node] of Object.entries(graph.nodes)) {
+    if (node.type !== "SCOPE" || node.status === "COMPLETED" || node.status === "FAILED") {
+      continue;
+    }
+    const children = Array.isArray(node.scope_children) ? node.scope_children : [];
+    if (
+      children.length > 0 &&
+      children.every((childId) => graph.nodes[childId] && graph.nodes[childId].status === "COMPLETED")
+    ) {
+      node.status = "COMPLETED";
+      node.completed_at = isoNow(now);
+      clearWorker(node);
+      closed.push(nodeId);
+    }
+  }
+  return closed;
+}
+
+function formatDependencyContext(nodes: Record<string, AtpNode>, node: AtpNode): string {
+  const dependencies = Array.isArray(node.dependencies) ? node.dependencies : [];
+  if (dependencies.length === 0) {
+    return "- No parent context; follow the instruction directly.";
+  }
+
+  return dependencies
+    .map((dependencyId) => {
+      const dependencyNode = nodes[dependencyId];
+      const status = dependencyNode?.status ?? "UNKNOWN";
+      const report =
+        typeof dependencyNode?.report === "string" && dependencyNode.report.trim().length > 0
+          ? dependencyNode.report.trim()
+          : "(no handoff provided)";
+      return `- From ${dependencyId} (${status}): ${report}`;
+    })
+    .join("\n");
+}
+
+function formatDownstreamContext(nodes: Record<string, AtpNode>, nodeId: string): string {
+  const children = findChildren(nodes, nodeId);
+  if (children.length === 0) {
+    return "- No downstream children yet.";
+  }
+
+  return children
+    .sort((left, right) => left.localeCompare(right))
+    .map((childId) => {
+      const child = nodes[childId];
+      return `- ${childId} (${child.status}): ${child.title}`;
+    })
+    .join("\n");
+}
+
+function formatClaimedTask(nodeId: string, node: AtpNode, nodes: Record<string, AtpNode>): ClaimedTask {
+  const staticContext =
+    typeof node.context === "string" && node.context.trim().length > 0
+      ? `STATIC CONTEXT:\n${node.context.trim()}\n`
+      : "";
+  const assignmentBlock = [
+    `TASK ASSIGNED: ${nodeId} - ${node.title}`,
+    `STATUS: ${node.status}`,
+    "INSTRUCTION:",
+    node.instruction.trim(),
+    staticContext ? staticContext.trimEnd() : null,
+    "CONTEXT FROM DEPENDENCIES:",
+    formatDependencyContext(nodes, node),
+    "DOWNSTREAM CHILDREN:",
+    formatDownstreamContext(nodes, nodeId),
+    "INSTRUCTION: Decompose only if this contains multiple independent outcomes or materially different verification paths.",
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
+
+  return {
+    nodeId,
+    title: node.title,
+    assignmentBlock,
+  };
+}
+
+function parseAtpGraph(raw: string, planPath: string): AtpGraph {
+  const parsed = JSON.parse(raw) as { meta?: Record<string, unknown>; nodes?: Record<string, AtpNode> };
+  if (!parsed || typeof parsed !== "object" || !parsed.nodes || typeof parsed.nodes !== "object") {
+    throw new Error(`ATP plan at ${planPath} is missing a top-level nodes object.`);
+  }
+  return parsed as AtpGraph;
+}
+
+async function withRunnerClaimLock<T>(planPath: string, fn: () => T): Promise<T> {
+  const lockPath = `${planPath}.runner-claim.lock`;
+  const deadline = Date.now() + 5_000;
+
+  while (true) {
+    try {
+      fs.mkdirSync(lockPath);
+      break;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") {
+        throw error;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for runner claim lock at ${lockPath}`);
+      }
+      await sleep(25);
+    }
+  }
+
+  try {
+    return fn();
+  } finally {
+    fs.rmSync(lockPath, { recursive: true, force: true });
+  }
+}
+
+export async function claimTaskLocally(planPath: string, agentId: string): Promise<LocalClaimResult> {
+  return withRunnerClaimLock(planPath, () => {
+    const raw = fs.readFileSync(planPath, "utf8");
+    const graph = parseAtpGraph(raw, planPath);
+
+    if (!projectIsActive(graph)) {
+      const projectStatus = typeof graph.meta?.project_status === "string" ? graph.meta.project_status : null;
+      return {
+        kind: "PROJECT_INACTIVE",
+        projectStatus,
+        message: `Project is not ACTIVE (status=${projectStatus ?? "unknown"}). Resume the project before claiming work.`,
+      };
+    }
+
+    const now = new Date();
+    const revived = releaseZombieClaims(graph, now);
+    const unblocked = refreshReadyNodes(graph);
+    const closedScopes = maybeCompleteScopes(graph, now);
+    const scopeUnblocked = refreshReadyNodes(graph);
+    const notes = [
+      ...(revived.length > 0 ? [`Recovered stale tasks: ${revived.join(", ")}.`] : []),
+      ...(unblocked.length > 0 ? [`Newly READY: ${unblocked.join(", ")}.`] : []),
+      ...(closedScopes.length > 0 ? [`Scopes completed: ${closedScopes.join(", ")}.`] : []),
+      ...(scopeUnblocked.length > 0 ? [`READY after scope closure: ${scopeUnblocked.join(", ")}.`] : []),
+    ];
+
+    for (const [nodeId, node] of Object.entries(graph.nodes)) {
+      if (node.worker_id === agentId && node.status === "CLAIMED") {
+        extendLease(node, now);
+        fs.writeFileSync(planPath, `${JSON.stringify(graph, null, 2)}\n`, "utf8");
+        return {
+          kind: "ASSIGNED",
+          task: formatClaimedTask(nodeId, node, graph.nodes),
+          notes,
+        };
+      }
+    }
+
+    const readyNodes = Object.entries(graph.nodes)
+      .filter(([, node]) => node.status === "READY" && node.type !== "SCOPE" && !nodeIsClosed(node))
+      .sort((left, right) => {
+        const leftDeps = Array.isArray(left[1].dependencies) ? left[1].dependencies.length : 0;
+        const rightDeps = Array.isArray(right[1].dependencies) ? right[1].dependencies.length : 0;
+        return leftDeps - rightDeps || left[0].localeCompare(right[0]);
+      });
+
+    if (readyNodes.length === 0) {
+      if (notes.length > 0) {
+        fs.writeFileSync(planPath, `${JSON.stringify(graph, null, 2)}\n`, "utf8");
+      }
+      return {
+        kind: "NO_TASKS_AVAILABLE",
+        message: "NO_TASKS_AVAILABLE: All tasks are blocked, claimed, or the project is finished.",
+        notes,
+      };
+    }
+
+    const [nodeId, node] = readyNodes[0];
+    node.status = "CLAIMED";
+    node.worker_id = agentId;
+    node.started_at = isoNow(now);
+    extendLease(node, now);
+
+    fs.writeFileSync(planPath, `${JSON.stringify(graph, null, 2)}\n`, "utf8");
+    return {
+      kind: "ASSIGNED",
+      task: formatClaimedTask(nodeId, node, graph.nodes),
+      notes,
+    };
   });
 }
 
@@ -2694,6 +3018,7 @@ async function runOneTaskCodex(
   config: RunnerConfig,
   promptTemplate: string,
   runtime: WorkerRuntime,
+  claimedTask: ClaimedTask,
   dashboard: RunnerDashboard,
 ): Promise<WorkerOutcome> {
   const workerId = runtime.workerId;
@@ -2709,9 +3034,10 @@ async function runOneTaskCodex(
     hasPreCommit: runtime.hasPreCommit,
     hasRuff: runtime.hasRuff,
     judgeMode: config.judgeMode,
+    claimedTask,
   });
 
-  dashboard.markWorkerStarted(workerId, `Launching Codex thread in ${runtime.workingDirectory}...`);
+  dashboard.markWorkerStarted(workerId, `Launching Codex thread for ${claimedTask.nodeId} in ${runtime.workingDirectory}...`);
 
   const env = toStringRecord(process.env, {
     ATP_FILE: config.atpFile,
@@ -2739,31 +3065,20 @@ async function runOneTaskCodex(
   const signals: SignalState = {
     sawNoTasks: false,
     sawProjectInactive: false,
-    sawTaskAssignment: false,
+    sawTaskAssignment: true,
     sawTaskMutation: false,
     sawFileChange: false,
-    assignedNodeId: null,
-    assignedTitle: null,
+    assignedNodeId: claimedTask.nodeId,
+    assignedTitle: claimedTask.title,
   };
   const startHead = getHeadSha(runtime.workingDirectory);
   const startDirty = hasUncommittedChanges(runtime.workingDirectory);
   const abortController = new AbortController();
-  let abortedForNoTask = false;
   let abortedForTimeout = false;
   const timeoutHandle = setTimeout(() => {
     abortedForTimeout = true;
     abortController.abort();
   }, config.workerTimeoutMs);
-
-  const maybeAbortNoTask = (): void => {
-    if (!signals.sawNoTasks || signals.sawTaskAssignment || signals.sawTaskMutation) {
-      return;
-    }
-    if (!abortController.signal.aborted) {
-      abortedForNoTask = true;
-      abortController.abort();
-    }
-  };
 
   try {
     const streamResult = await thread.runStreamed(systemPrompt, { signal: abortController.signal });
@@ -2813,7 +3128,6 @@ async function runOneTaskCodex(
             signals.assignedNodeId = assignment.nodeId;
             signals.assignedTitle = assignment.title;
           }
-          maybeAbortNoTask();
 
           const summary = summarizeAgentText(text);
           dashboard.markWorkerEvent(workerId, summary, {
@@ -2848,14 +3162,13 @@ async function runOneTaskCodex(
             signals.assignedNodeId = assignment.nodeId;
             signals.assignedTitle = assignment.title;
           }
-          maybeAbortNoTask();
 
-          if (item.tool.includes("atp_claim_task") && combined.includes(TASK_ASSIGNED_MARKER)) {
-            signals.sawTaskAssignment = true;
-            dashboard.markWorkerEvent(workerId, "Claimed ATP task", {
-              bump: 8,
+          if (item.tool.includes("atp_claim_task")) {
+            dashboard.markWorkerEvent(workerId, "Unexpected atp_claim_task call", {
+              bump: 2,
               minProgress: 45,
               logEvent: true,
+              logLevel: "warn",
             });
           } else if (item.tool.includes("atp_complete_task")) {
             signals.sawTaskMutation = true;
@@ -2915,13 +3228,6 @@ async function runOneTaskCodex(
     }
   } catch (error) {
     clearTimeout(timeoutHandle);
-    if (abortedForNoTask) {
-      return {
-        kind: "NO_TASKS_AVAILABLE",
-        workerId,
-        details: "No claimable tasks available",
-      };
-    }
     if (abortedForTimeout) {
       return {
         kind: "ERROR",
@@ -2990,10 +3296,8 @@ async function runOneTaskCodex(
     kind: "ACTIVITY",
     workerId,
     details: signals.sawTaskMutation
-      ? "Claimed and updated ATP graph"
-      : signals.sawTaskAssignment
-        ? "Claimed ATP work and progressed execution"
-        : "Completed worker turn",
+      ? `Executed ${claimedTask.nodeId} and updated ATP graph`
+      : `Executed ${claimedTask.nodeId}`,
   };
 }
 
@@ -3001,12 +3305,12 @@ function detectClaudeToolSignals(text: string, signals: SignalState, workerId: s
   const lower = text.toLowerCase();
   const mentionsTool = lower.includes("tool");
 
-  if (mentionsTool && lower.includes("atp_claim_task") && text.includes(TASK_ASSIGNED_MARKER)) {
-    signals.sawTaskAssignment = true;
-    dashboard.markWorkerEvent(workerId, "Claimed ATP task", {
-      bump: 8,
+  if (mentionsTool && lower.includes("atp_claim_task")) {
+    dashboard.markWorkerEvent(workerId, "Unexpected atp_claim_task call", {
+      bump: 2,
       minProgress: 45,
       logEvent: true,
+      logLevel: "warn",
     });
   }
   if (mentionsTool && lower.includes("atp_complete_task")) {
@@ -3050,6 +3354,7 @@ async function runOneTaskClaude(
   config: RunnerConfig,
   promptTemplate: string,
   runtime: WorkerRuntime,
+  claimedTask: ClaimedTask,
   dashboard: RunnerDashboard,
 ): Promise<WorkerOutcome> {
   const workerId = runtime.workerId;
@@ -3065,9 +3370,10 @@ async function runOneTaskClaude(
     hasPreCommit: runtime.hasPreCommit,
     hasRuff: runtime.hasRuff,
     judgeMode: config.judgeMode,
+    claimedTask,
   });
 
-  dashboard.markWorkerStarted(workerId, `Launching Claude turn in ${runtime.workingDirectory}...`);
+  dashboard.markWorkerStarted(workerId, `Launching Claude turn for ${claimedTask.nodeId} in ${runtime.workingDirectory}...`);
 
   const env = toStringRecord(process.env, {
     ATP_FILE: config.atpFile,
@@ -3101,28 +3407,17 @@ async function runOneTaskClaude(
   const signals: SignalState = {
     sawNoTasks: false,
     sawProjectInactive: false,
-    sawTaskAssignment: false,
+    sawTaskAssignment: true,
     sawTaskMutation: false,
     sawFileChange: false,
-    assignedNodeId: null,
-    assignedTitle: null,
+    assignedNodeId: claimedTask.nodeId,
+    assignedTitle: claimedTask.title,
   };
   const startHead = getHeadSha(runtime.workingDirectory);
   const startDirty = hasUncommittedChanges(runtime.workingDirectory);
 
-  let abortedForNoTask = false;
   let abortedForTimeout = false;
   let stderrText = "";
-
-  const maybeAbortNoTask = (): void => {
-    if (!signals.sawNoTasks || signals.sawTaskAssignment || signals.sawTaskMutation) {
-      return;
-    }
-    if (!child.killed) {
-      abortedForNoTask = true;
-      child.kill("SIGTERM");
-    }
-  };
 
   const timeoutHandle = setTimeout(() => {
     abortedForTimeout = true;
@@ -3176,7 +3471,6 @@ async function runOneTaskClaude(
         logEvent: true,
       });
     }
-    maybeAbortNoTask();
   });
 
   let exitCode: number | null;
@@ -3234,14 +3528,6 @@ async function runOneTaskClaude(
     }
   }
 
-  if (abortedForNoTask || (signals.sawNoTasks && !signals.sawTaskAssignment && !signals.sawTaskMutation)) {
-    return {
-      kind: "NO_TASKS_AVAILABLE",
-      workerId,
-      details: "No claimable tasks available",
-    };
-  }
-
   if (abortedForTimeout) {
     return {
       kind: "ERROR",
@@ -3271,10 +3557,8 @@ async function runOneTaskClaude(
     kind: "ACTIVITY",
     workerId,
     details: signals.sawTaskMutation
-      ? "Claimed and updated ATP graph"
-      : signals.sawTaskAssignment
-        ? "Claimed ATP work and progressed execution"
-        : "Completed worker turn",
+      ? `Executed ${claimedTask.nodeId} and updated ATP graph`
+      : `Executed ${claimedTask.nodeId}`,
   };
 }
 
@@ -3282,12 +3566,13 @@ async function runOneTask(
   config: RunnerConfig,
   promptTemplate: string,
   runtime: WorkerRuntime,
+  claimedTask: ClaimedTask,
   dashboard: RunnerDashboard,
 ): Promise<WorkerOutcome> {
   if (config.agentProvider === "claude") {
-    return runOneTaskClaude(config, promptTemplate, runtime, dashboard);
+    return runOneTaskClaude(config, promptTemplate, runtime, claimedTask, dashboard);
   }
-  return runOneTaskCodex(config, promptTemplate, runtime, dashboard);
+  return runOneTaskCodex(config, promptTemplate, runtime, claimedTask, dashboard);
 }
 
 async function main(): Promise<void> {
@@ -3364,10 +3649,76 @@ async function main(): Promise<void> {
     while (!exiting) {
       round += 1;
       dashboard.beginRound(round, idleRounds, allErrorRounds);
+      const plannedTurns: Array<Promise<WorkerOutcome>> = [];
+      let projectInactive = false;
+      let queueExhausted = false;
 
-      const outcomes = await Promise.all(
-        workerRuntimes.map((runtime) => runOneTask(config, promptTemplate, runtime, dashboard)),
-      );
+      for (const runtime of workerRuntimes) {
+        if (projectInactive) {
+          plannedTurns.push(
+            Promise.resolve({
+              kind: "PROJECT_INACTIVE",
+              workerId: runtime.workerId,
+              details: "Project reported as not ACTIVE",
+            }),
+          );
+          continue;
+        }
+        if (queueExhausted) {
+          plannedTurns.push(
+            Promise.resolve({
+              kind: "NO_TASKS_AVAILABLE",
+              workerId: runtime.workerId,
+              details: "No claimable tasks available",
+            }),
+          );
+          continue;
+        }
+
+        const claim = await claimTaskLocally(config.atpFile, runtime.workerId);
+        if (claim.kind === "PROJECT_INACTIVE") {
+          projectInactive = true;
+          plannedTurns.push(
+            Promise.resolve({
+              kind: "PROJECT_INACTIVE",
+              workerId: runtime.workerId,
+              details: "Project reported as not ACTIVE",
+            }),
+          );
+          continue;
+        }
+        if (claim.kind === "NO_TASKS_AVAILABLE") {
+          queueExhausted = true;
+          const extra = claim.notes.length > 0 ? ` ${claim.notes.join(" ")}` : "";
+          dashboard.markWorkerEvent(runtime.workerId, `No claimable tasks available.${extra}`.trim(), {
+            bump: 4,
+            minProgress: 20,
+            logEvent: claim.notes.length > 0,
+          });
+          plannedTurns.push(
+            Promise.resolve({
+              kind: "NO_TASKS_AVAILABLE",
+              workerId: runtime.workerId,
+              details: "No claimable tasks available",
+            }),
+          );
+          continue;
+        }
+
+        const noteSuffix = claim.notes.length > 0 ? ` ${claim.notes.join(" ")}` : "";
+        dashboard.markWorkerEvent(
+          runtime.workerId,
+          `Runner claimed ${claim.task.nodeId} - ${truncatePlain(claim.task.title, 60)}${noteSuffix}`,
+          {
+            bump: 8,
+            minProgress: 28,
+            logEvent: true,
+          },
+        );
+        plannedTurns.push(runOneTask(config, promptTemplate, runtime, claim.task, dashboard));
+      }
+
+      const outcomes = await Promise.all(plannedTurns);
 
       outcomes.forEach((outcome) => {
         dashboard.markWorkerOutcome(outcome);
